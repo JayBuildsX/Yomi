@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: yomi
+    runtime: node
+    buildCommand: npm install && npm install --prefix client && npm install --prefix server && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health

@@ -1,0 +1,23 @@
+import express from 'express';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { OlympusSource, SourceError } from './olympus.js';
+const app = express(); const source = new OlympusSource(); const cache = new Map<string, { until: number; value: unknown }>();
+const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const clientDist = path.join(projectRoot, 'client', 'dist');
+const validSlug = /^[a-z0-9][a-z0-9-]{0,150}$/i; const validChapter = /^[a-z0-9][a-z0-9.-]{0,80}$/i;
+const cached = async <T>(key: string, get: () => Promise<T>) => { const hit = cache.get(key); if (hit && hit.until > Date.now()) return hit.value as T; const value = await get(); cache.set(key, { until: Date.now() + 120_000, value }); return value; };
+const send = (fn: (req: express.Request) => Promise<unknown>) => async (req: express.Request, res: express.Response) => { try { res.json(await fn(req)); } catch (e) { const error = e instanceof SourceError ? e : new SourceError('Unexpected server error.'); res.status(error.status).json({ error: error.message }); } };
+app.get('/api/health', (_req, res) => res.json({ ok: true, source: 'olympus' }));
+app.get('/api/latest', send(() => cached('latest', () => source.getLatest())));
+app.get('/api/search', send(async req => { const q = typeof req.query.q === 'string' ? req.query.q.trim() : ''; if (!q || q.length > 100) throw new SourceError('Provide a search query up to 100 characters.', 400); return cached(`search:${q.toLowerCase()}`, () => source.search(q)); }));
+app.get('/api/manga/:mangaId', send(req => { const mangaId = String(req.params.mangaId); if (!validSlug.test(mangaId)) throw new SourceError('Malformed manga ID.', 400); return cached(`manga:${mangaId}`, () => source.getManga(mangaId)); }));
+app.get('/api/manga/:mangaId/chapter/:chapterId', send(req => { const mangaId = String(req.params.mangaId); const chapterId = String(req.params.chapterId); if (!validSlug.test(mangaId) || !validChapter.test(chapterId)) throw new SourceError('Malformed chapter ID.', 400); return source.getChapter(mangaId, chapterId); }));
+const allowedImageHosts = new Set(['olympustaff.com']);
+app.get('/api/image', async (req, res) => { try { const raw = typeof req.query.url === 'string' ? req.query.url : ''; const url = new URL(raw); if (url.protocol !== 'https:' || !allowedImageHosts.has(url.hostname)) throw new SourceError('Image host is not allowed.', 400); const upstream = await fetch(url, { headers: { 'User-Agent': 'Yomi personal reader/0.1' }, redirect: 'manual', signal: AbortSignal.timeout(12_000) }); const type = upstream.headers.get('content-type') ?? ''; const length = Number(upstream.headers.get('content-length') ?? 0); if (!upstream.ok || !type.startsWith('image/') || length > 12_000_000 || !upstream.body) throw new SourceError('Image is unavailable.', 502); res.type(type); const reader = upstream.body.getReader(); let total = 0; while (true) { const { value, done } = await reader.read(); if (done) break; total += value.byteLength; if (total > 12_000_000) { res.destroy(); return; } res.write(Buffer.from(value)); } res.end(); } catch (e) { if (!res.headersSent) { const error = e instanceof SourceError ? e : new SourceError('Image request failed.'); res.status(error.status).json({ error: error.message }); } } });
+// Keep API misses out of the SPA fallback: browser routes are the only routes that return index.html.
+app.use('/api', (_req, res) => res.status(404).json({ error: 'API route not found.' }));
+app.use(express.static(clientDist, { index: false, maxAge: '1h' }));
+app.get('*', (_req, res) => res.sendFile(path.join(clientDist, 'index.html')));
+const port = Number(process.env.PORT) || 8787;
+app.listen(port, '0.0.0.0', () => console.log(`Yomi listening on http://0.0.0.0:${port}`));
